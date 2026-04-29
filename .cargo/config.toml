@@ -1,0 +1,8 @@
+[target.wasm32-wasip1]
+# Point to WASI SDK's clang for C compilation
+# These are overridden by CI env vars; local dev uses WASI_SDK_PATH
+linker = "wasm-ld"
+
+[target.wasm32-wasip1.env]
+CC_wasm32_wasip1 = "clang"
+AR_wasm32_wasip1 = "llvm-ar"
