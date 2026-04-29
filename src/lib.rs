@@ -11,10 +11,7 @@ pub fn init() {
 /// A stateful proofer that caches the LittleCMS transform for performance.
 #[wasm_bindgen]
 pub struct SoftProofer {
-    srgb: Profile,
-    printer: Profile,
-    intent: Intent,
-    is_16bit: bool,
+    transform: Transform<[u8; 4], [u8; 4]>,
 }
 
 use serde::{Deserialize, Serialize};
@@ -35,18 +32,29 @@ pub struct PostProcessOptions {
 #[wasm_bindgen]
 impl SoftProofer {
     #[wasm_bindgen(constructor)]
-    pub fn new(printer_profile_icc: &[u8], intent: u32, use_16bit: bool) -> Result<SoftProofer, JsError> {
+    pub fn new(printer_profile_icc: &[u8], intent: u32, _use_16bit: bool) -> Result<SoftProofer, JsError> {
         let srgb = Profile::new_srgb();
         let printer = Profile::new_icc(printer_profile_icc)
             .map_err(|e| JsError::new(&format!("Invalid ICC profile: {:?}", e)))?;
         
         let intent = intent_from_u32(intent)?;
 
-        Ok(SoftProofer {
-            srgb,
-            printer,
+        // Create a proofing transform: sRGB -> Printer -> sRGB
+        // This is the standard way to do soft proofing in LittleCMS.
+        // We use RGBA_8 for both input and output to match the JS ImageData format.
+        let transform = Transform::new_proofing(
+            &srgb,
+            PixelFormat::RGBA_8,
+            &srgb,
+            PixelFormat::RGBA_8,
+            &printer,
             intent,
-            is_16bit: use_16bit,
+            Intent::AbsoluteColorimetric,
+            Flags::SOFT_PROOFING | Flags::BLACKPOINT_COMPENSATION,
+        ).map_err(|e| JsError::new(&format!("Failed to create proofing transform: {:?}", e)))?;
+
+        Ok(SoftProofer {
+            transform,
         })
     }
 
@@ -65,53 +73,11 @@ impl SoftProofer {
 
         let mut output = vec![0u8; expected_len];
 
-        if self.is_16bit {
-            let pixel_count = (width as usize) * (height as usize);
-            // Stage 1: sRGB 8-bit → Printer 16-bit
-            let to_printer = Transform::new(
-                &self.srgb,
-                PixelFormat::RGBA_8,
-                &self.printer,
-                PixelFormat::RGBA_16,
-                self.intent,
-            ).map_err(|e| JsError::new(&format!("Forward transform failed: {:?}", e)))?;
-
-            let mut intermediate = vec![0u16; pixel_count * 4];
-            to_printer.transform_pixels(
-                bytemuck::cast_slice::<u8, [u8; 4]>(pixels),
-                bytemuck::cast_slice_mut::<u16, [u16; 4]>(&mut intermediate),
-            );
-
-            // Stage 2: Printer 16-bit → sRGB 8-bit
-            let to_monitor = Transform::new(
-                &self.printer,
-                PixelFormat::RGBA_16,
-                &self.srgb,
-                PixelFormat::RGBA_8,
-                Intent::AbsoluteColorimetric,
-            ).map_err(|e| JsError::new(&format!("Return transform failed: {:?}", e)))?;
-
-            to_monitor.transform_pixels(
-                bytemuck::cast_slice::<u16, [u16; 4]>(&intermediate),
-                bytemuck::cast_slice_mut::<u8, [u8; 4]>(&mut output),
-            );
-        } else {
-            let transform = Transform::new_proofing(
-                &self.srgb,
-                PixelFormat::RGBA_8,
-                &self.srgb,
-                PixelFormat::RGBA_8,
-                &self.printer,
-                self.intent,
-                Intent::AbsoluteColorimetric,
-                Flags::SOFT_PROOFING | Flags::BLACKPOINT_COMPENSATION,
-            ).map_err(|e| JsError::new(&format!("Transform creation failed: {:?}", e)))?;
-
-            transform.transform_pixels(
-                bytemuck::cast_slice::<u8, [u8; 4]>(pixels),
-                bytemuck::cast_slice_mut::<u8, [u8; 4]>(&mut output),
-            );
-        }
+        // Apply the cached proofing transform
+        self.transform.transform_pixels(
+            bytemuck::cast_slice::<u8, [u8; 4]>(pixels),
+            bytemuck::cast_slice_mut::<u8, [u8; 4]>(&mut output),
+        );
 
         // Restore alpha channel (restore from source)
         for i in 0..(pixels.len() / 4) {
